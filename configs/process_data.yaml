@@ -1,0 +1,11 @@
+defaults:
+  - _self_
+  - clip/general
+
+process_data_config:
+  num_processes: 10
+  shuffle_before_split: true
+  split_ratios:
+    train: 0.7
+    val: 0.15
+    test: 0.15

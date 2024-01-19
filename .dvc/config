@@ -1,0 +1,5 @@
+[core]
+    autostage = true
+    remote = default
+['remote "default"']
+    url = s3://acatsama-poms/nixtla_benckmark/

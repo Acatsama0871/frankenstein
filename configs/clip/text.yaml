@@ -1,0 +1,12 @@
+text_model:
+  vocab_size: 49408
+  hidden_size: 512
+  intermediate_size: 2048
+  num_hidden_layers: 12
+  num_attention_heads: 8
+  max_position_embeddings: 77
+  hidden_act: quick_gelu
+  layer_norm_eps: 0.00001
+  attention_dropout: 0.0
+  initializer_range: 0.02
+  initializer_factor: 1.0
