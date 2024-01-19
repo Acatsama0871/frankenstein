@@ -1,5 +1,5 @@
 #!/bin/bash
 
-tar -cf - data/01_raw/outfits | zstd -o data/01_raw/outfits.tar.zst
+tar --zstd -cf data/01_raw/outfits.tar.zst data/01_raw/outfits/
 dvc add data
 dvc push
