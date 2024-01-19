@@ -1,10 +1,11 @@
 import os
+import torch
 import numpy as np
 from PIL import Image
 from functools import partial
 from datasets import Dataset, DatasetDict, load_dataset
 from rich import print
-from typing import Dict, Any, Iterable, Dict
+from typing import Dict, Any, Dict, Callable
 from omegaconf import DictConfig
 from transformers import CLIPProcessor
 
@@ -17,15 +18,32 @@ def load_image(example: Dict[str, Any], image_root_folder_path: str) -> Dict[str
     top_image = Image.open(
         os.path.join(image_root_folder_path, item_id, "U.jpg")
     ).convert("RGB")
-    example["bottom_image"] = np.array(bottom_image)
-    example["top_image"] = np.array(top_image)
+    example["bottom_image"] = bottom_image
+    example["top_image"] = top_image
 
     return example
 
-def process_data(processor: CLIPProcessor, batched_examples: Iterable[Dict[str, Any]]) -> Iterable[Dict[str, Any]]:
-    tokenizer = processor.tokenizer
-    temp = tokenizer(batched_examples["bottom_texts"], padding=True, truncation=True, return_tensors="np")
-    batched_examples["bottom_input_ids"] = temp["input_ids"]
+def clip_process_data(batched_examples: Dict, data_processor: Callable) -> Dict:
+    bottom_texts = batched_examples["bottom_text"]
+    top_texts = batched_examples["top_text"]
+    bottom_images = batched_examples["bottom_image"]
+    top_images = batched_examples["top_image"]
+    bottom_images = [np.array(i) for i in bottom_images]
+    top_images = [np.array(i) for i in top_images]
+    
+    # process text
+    bottom_text_output = data_processor.tokenizer(text=bottom_texts, padding=True, truncation=True, return_tensors="pt")
+    top_text_output  = data_processor.tokenizer(text=top_texts, padding=True, truncation=True, return_tensors="pt")
+    # bottom_images = data_processor.image_processor(images=np.array(bottom_images))
+    # top_images = data_processor.image_processor(images=np.array(top_images))
+    
+    batched_examples["bottom_input_ids"] = bottom_text_output["input_ids"]
+    batched_examples["bottom_attention_mask"] = bottom_text_output["attention_mask"]
+    batched_examples["top_input_ids"] = top_text_output ["input_ids"]
+    batched_examples["top_attention_mask"] = top_text_output ["attention_mask"]
+    # batched_examples["bottom_processed_image"] = bottom_images["pixel_values"]
+    # batched_examples["top_processed_image"] = top_images["pixel_values"]
+    
     return batched_examples
 
 
@@ -41,49 +59,19 @@ def process_data_dataset(
     # load json file with datasets
     dataset = load_dataset("json", data_files=text_file_path, split="train")
     dataset = dataset.rename_column("Item#", "item_id")
+    dataset = dataset.rename_column("bottom_texts", "bottom_text")
+    dataset = dataset.rename_column("top_texts", "top_text")
     # TODO: debug
     dataset = dataset.select(range(10))
     # TODO: debug
 
     # load image
     load_image_func = partial(load_image, image_root_folder_path=img_root_folder_path)
-    dataset = dataset.map(load_image_func, num_proc=num_proc)
+    dataset = dataset.map(load_image_func)
 
     # process data
     clip_processor = CLIPProcessor.from_pretrained(
         pretrained_model_name_or_path=model_name
     )
-    clip_process_func = partial(clip_processor, processor=clip_processor)
-    dataset = dataset.map(clip_process_func, batched=True, num_proc=num_proc)
-    # dataset.set_format(None, columns=["bottom_texts", "top_texts"])
-    # print(dataset)
-    # print(dataset[0].keys())
-    # print(dataset[:3]["bottom_texts"])
-    
-    #dataset = dataset.map(clip_process_func, batched=True, num_proc=num_proc)
-
-    # process via clip processor
-    # dataset.set_format("numpy", columns=["bottom_image", "top_image"])
-    # for i, example in enumerate(dataset):
-    #     print(f"========{i}=======")
-    #     print(example["top_image"].shape)
-    #     print(example["bottom_image"].shape)
-    #     # print(example["bottom_image"])
-    #     # print(example["bottom_image"].shape)
-    #     # print(example["top_image"].shape)
-    #     print("================")
-
-    # construct dataset
-    # # load image
-    # load_image_func = partial(load_image, image_root_folder_path=img_root_folder_path)
-    # dataset = dataset.map(load_image_func, num_proc=num_proc)
-
-    # # splits
-    # ratios = [split_ratios["train"], split_ratios["val"], split_ratios["test"]]
-    # dataset = dataset.train_test_split(train_size=ratios[0], shuffle=shuffle)
-    # dataset_train = dataset["train"]
-    # dataset_temp = dataset["test"]
-    # dataset_temp = dataset_temp.train_test_split(test_size=ratios[2], shuffle=shuffle)
-    # dataset_val = dataset_temp["train"]
-    # dataset_test = dataset_temp["test"]
-    # dataset = DatasetDict({"train": dataset_train, "val": dataset_val, "test": dataset_test})
+    dataset = dataset.map(clip_process_data, fn_kwargs={"data_processor": clip_processor}, batched=True, num_proc=num_proc)
+    print(dataset)
