@@ -1,34 +1,33 @@
 import os
+import numpy as np
 from PIL import Image
-from functools import partial
-from datasets import DatasetDict, load_dataset
-from typing import Dict, Any, Dict
+from datasets import load_dataset
+from typing import Dict, Any, Dict, Tuple
 from omegaconf import DictConfig
+from rich import print
 from transformers import CLIPProcessor
+from tqdm.auto import tqdm
+from functools import partial
+from concurrent.futures import ThreadPoolExecutor
 
 
-def load_image(example: Dict[str, Any], image_root_folder_path: str) -> Dict[str, Any]:
+def load_image_func(example: Dict[str, Any], image_root_folder_path: str) -> Tuple:
     try:
-        _load_image_single(example, image_root_folder_path)
+        item_id = str(example["item_id"])
+        bottom_image = np.array(
+            Image.open(os.path.join(image_root_folder_path, item_id, "B.jpg")).convert(
+                "RGB"
+            )
+        )
+        top_image = np.array(
+            Image.open(os.path.join(image_root_folder_path, item_id, "U.jpg")).convert(
+                "RGB"
+            )
+        )
     except Exception:
-        example["error"] = True
-        return example
+        return None, None, False
 
-    return example
-
-
-# TODO Rename this here and in `load_image`
-def _load_image_single(example, image_root_folder_path):
-    item_id = str(example["item_id"])
-    bottom_image = Image.open(
-        os.path.join(image_root_folder_path, item_id, "B.jpg")
-    ).convert("RGB")
-    top_image = Image.open(
-        os.path.join(image_root_folder_path, item_id, "U.jpg")
-    ).convert("RGB")
-    example["bottom_image"] = bottom_image
-    example["top_image"] = top_image
-    example["error"] = False
+    return bottom_image.tolist(), top_image.tolist(), True
 
 
 def process_data_dataset(
@@ -47,9 +46,30 @@ def process_data_dataset(
     dataset = dataset.rename_column("top_texts", "top_text")
 
     # load image
-    load_image_func = partial(load_image, image_root_folder_path=img_root_folder_path)
-    dataset = dataset.map(load_image_func, num_proc=num_proc)
-    dataset = dataset.filter(lambda example: example["error"] == False)
+    load_image_func_with_root = partial(
+        load_image_func, image_root_folder_path=img_root_folder_path
+    )
+    with ThreadPoolExecutor(max_workers=num_proc) as executor:
+        result = list(
+            tqdm(executor.map(load_image_func_with_root, dataset), total=len(dataset))
+        )
+    bottom_image_list = []
+    top_image_list = []
+    success_flag_list = []
+    for bottom_image, top_image, success_flag in tqdm(result):
+        bottom_image_list.append(bottom_image)
+        top_image_list.append(top_image)
+        success_flag_list.append(success_flag)
+
+    # add lists to dataset
+    dataset = dataset.add_column(name="bottom_image", column=bottom_image_list)
+    print("[red]Bottom image added[/red]")
+    dataset = dataset.add_column(name="top_image", column=top_image_list)
+    print("[red]Top image added[/red]")
+    dataset = dataset.add_column(name="success_flag", column=success_flag_list)
+    print("[red]Success flag added[/red]")
+    dataset = dataset.filter(lambda example: example["success_flag"] == True)
+    dataset = dataset.remove_columns(["success_flag"])
 
     # process data
     clip_processor = CLIPProcessor.from_pretrained(
@@ -60,7 +80,7 @@ def process_data_dataset(
     dataset = dataset.map(clip_processor.tokenizer, input_columns="bottom_text", fn_kwargs={"truncation": True, "padding": True, "return_tensors": "pt"}, batched=True, num_proc=num_proc)  # type: ignore
     dataset = dataset.rename_column("input_ids", "bottom_input_ids")
     dataset = dataset.rename_column("attention_mask", "bottom_attention_mask")
-    dataset = dataset.map(clip_processor.image_processor, input_columns="bottom_image", fn_kwargs={"return_tensors": "pt"}, batched=True, num_proc=num_proc)  # type: ignore
+    dataset = dataset.map(lambda x: clip_processor.image_processor(np.array(x), return_tensors="pt"), input_columns="bottom_image", batched=True, num_proc=num_proc)  # type: ignore
     dataset = dataset.rename_column("pixel_values", "bottom_processed_image")
     dataset = dataset.map(
         clip_processor,
@@ -70,7 +90,7 @@ def process_data_dataset(
     )
     dataset = dataset.rename_column("input_ids", "top_input_ids")
     dataset = dataset.rename_column("attention_mask", "top_attention_mask")
-    dataset = dataset.map(clip_processor.image_processor, input_columns="top_image", fn_kwargs={"return_tensors": "pt"}, batched=True, num_proc=num_proc)  # type: ignore
+    dataset = dataset.map(lambda x: clip_processor.image_processor(np.array(x), return_tensors="pt"), input_columns="top_image", batched=True, num_proc=num_proc)  # type: ignore
     dataset = dataset.rename_column("pixel_values", "top_processed_image")
 
     # split
