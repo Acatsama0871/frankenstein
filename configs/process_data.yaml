@@ -3,7 +3,7 @@ defaults:
   - clip/general
 
 process_data_config:
-  num_processes: 1
+  num_processes: 10
   shuffle_before_split: true
   split_ratios:
     train: 0.7
