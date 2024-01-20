@@ -2,7 +2,7 @@ import os
 import numpy as np
 from PIL import Image
 from datasets import load_dataset
-from typing import Dict, Any, Dict, Tuple
+from typing import Any, Dict, Tuple
 from omegaconf import DictConfig
 from rich import print
 from transformers import CLIPProcessor
@@ -40,10 +40,12 @@ def process_data_dataset(
     model_name = config["clip"]["general"]["base_model"]
 
     # load json file with datasets
-    dataset = load_dataset("json", data_files=text_file_path, split="train")
+    dataset = load_dataset("json", data_files=text_file_path, split="train", keep_in_memory=False)
     dataset = dataset.rename_column("Item#", "item_id")
     dataset = dataset.rename_column("bottom_texts", "bottom_text")
     dataset = dataset.rename_column("top_texts", "top_text")
+    dataset = dataset.select(range(100))
+    print("Text Dataset Loaded.")
 
     # load image
     load_image_func_with_root = partial(
