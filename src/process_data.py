@@ -1,17 +1,16 @@
 import os
+import gc
+import tempfile
 import numpy as np
-from PIL import Image
-from datasets import load_dataset
-from typing import Any, Dict, Tuple
-from omegaconf import DictConfig
-from rich import print
-from transformers import CLIPProcessor
 from tqdm.auto import tqdm
-from functools import partial
-from concurrent.futures import ThreadPoolExecutor
+from PIL import Image
+from datasets import load_dataset, load_from_disk, concatenate_datasets
+from typing import Any, Dict
+from omegaconf import DictConfig
+from transformers import CLIPProcessor
 
 
-def load_image_func(example: Dict[str, Any], image_root_folder_path: str) -> Tuple:
+def load_image_func(example: Dict[str, Any], image_root_folder_path: str) -> Dict:
     try:
         item_id = str(example["item_id"])
         bottom_image = np.array(
@@ -24,10 +23,31 @@ def load_image_func(example: Dict[str, Any], image_root_folder_path: str) -> Tup
                 "RGB"
             )
         )
-    except Exception:
-        return None, None, False
+    except FileNotFoundError:
+        example["bottom_image"] = None
+        example["top_image"] = None
+        return example
 
-    return bottom_image.tolist(), top_image.tolist(), True
+    example["bottom_image"] = bottom_image
+    example["top_image"] = top_image
+
+    return example
+
+
+def filtered_empty_item(example: Dict[str, Any]) -> bool:
+    image_condition = (example["bottom_image"] is not None) and (
+        example["top_image"] is not None
+    )
+    text_condition = (
+        (example["top_text"] is not None)
+        and (example["bottom_image"] is not None)
+        and (len(example["top_text"]) > 0)
+        and (len(example["bottom_text"]) > 0)
+    )
+    judgement_condition = (example["judgement_reason"] is not None) and (
+        example["judgement"] is not None
+    )
+    return judgement_condition & text_condition & image_condition
 
 
 def process_data_dataset(
@@ -38,78 +58,101 @@ def process_data_dataset(
     shuffle = config["process_data_config"]["shuffle_before_split"]
     split_ratios = config["process_data_config"]["split_ratios"]
     model_name = config["clip"]["general"]["base_model"]
+    num_shards = config["process_data_config"]["num_shards"]
+    temp_dir_base_path = config["process_data_config"]["temp_dir_base_path"]
 
     # load json file with datasets
-    dataset = load_dataset("json", data_files=text_file_path, split="train", keep_in_memory=False)
+    dataset = load_dataset(
+        "json", data_files=text_file_path, split="train", keep_in_memory=False
+    )
     dataset = dataset.rename_column("Item#", "item_id")
     dataset = dataset.rename_column("bottom_texts", "bottom_text")
     dataset = dataset.rename_column("top_texts", "top_text")
-    dataset = dataset.select(range(100))
-    print("Text Dataset Loaded.")
 
-    # load image
-    load_image_func_with_root = partial(
-        load_image_func, image_root_folder_path=img_root_folder_path
-    )
-    with ThreadPoolExecutor(max_workers=num_proc) as executor:
-        result = list(
-            tqdm(executor.map(load_image_func_with_root, dataset), total=len(dataset))
-        )
-    bottom_image_list = []
-    top_image_list = []
-    success_flag_list = []
-    for bottom_image, top_image, success_flag in tqdm(result):
-        bottom_image_list.append(bottom_image)
-        top_image_list.append(top_image)
-        success_flag_list.append(success_flag)
-
-    # add lists to dataset
-    dataset = dataset.add_column(name="bottom_image", column=bottom_image_list)
-    print("[red]Bottom image added[/red]")
-    dataset = dataset.add_column(name="top_image", column=top_image_list)
-    print("[red]Top image added[/red]")
-    dataset = dataset.add_column(name="success_flag", column=success_flag_list)
-    print("[red]Success flag added[/red]")
-    dataset = dataset.filter(lambda example: example["success_flag"] == True)
-    dataset = dataset.remove_columns(["success_flag"])
-
-    # process data
+    # get feature processors
     clip_processor = CLIPProcessor.from_pretrained(
         pretrained_model_name_or_path=model_name
     )
 
-    # process bottom data
-    dataset = dataset.map(clip_processor.tokenizer, input_columns="bottom_text", fn_kwargs={"truncation": True, "padding": True, "return_tensors": "pt"}, batched=True, num_proc=num_proc)  # type: ignore
-    dataset = dataset.rename_column("input_ids", "bottom_input_ids")
-    dataset = dataset.rename_column("attention_mask", "bottom_attention_mask")
-    dataset = dataset.map(lambda x: clip_processor.image_processor(np.array(x), return_tensors="pt"), input_columns="bottom_image", batched=True, num_proc=num_proc)  # type: ignore
-    dataset = dataset.rename_column("pixel_values", "bottom_processed_image")
-    dataset = dataset.map(
-        clip_processor,
-        input_columns="top_text",
-        batched=True,
-        fn_kwargs={"truncation": True, "padding": True, "return_tensors": "pt"},
-    )
-    dataset = dataset.rename_column("input_ids", "top_input_ids")
-    dataset = dataset.rename_column("attention_mask", "top_attention_mask")
-    dataset = dataset.map(lambda x: clip_processor.image_processor(np.array(x), return_tensors="pt"), input_columns="top_image", batched=True, num_proc=num_proc)  # type: ignore
-    dataset = dataset.rename_column("pixel_values", "top_processed_image")
+    # process each shard
+    shard_paths = []
+    with tempfile.TemporaryDirectory(dir=temp_dir_base_path) as temp_dir:
+        # split the dataset to shards to avoid OOM
+        for i in tqdm(range(num_shards)):
+            cur_shard = dataset.shard(num_shards=num_shards, index=i)
 
-    # split
-    dataset = dataset.shuffle(shuffle)
-    dataset = dataset.flatten_indices()  # type: ignore
-    dataset = dataset.train_test_split(  # type: ignore
-        train_size=split_ratios["train"], shuffle=False
-    )
-    train_dataset = dataset["train"]
-    temp_dataset = dataset["test"].train_test_split(
-        test_size=split_ratios["test"] / (split_ratios["val"] + split_ratios["test"]),
-        shuffle=False,
-    )
-    valid_dataset = temp_dataset["train"]
-    test_dataset = temp_dataset["test"]
+            # load image
+            cur_shard = cur_shard.map(
+                lambda examples: load_image_func(examples, img_root_folder_path),
+                num_proc=num_proc,
+            )
+            cur_shard = cur_shard.filter(filtered_empty_item, num_proc=num_proc)
 
-    # save
-    train_dataset.save_to_disk(os.path.join(save_path, "train"))
-    valid_dataset.save_to_disk(os.path.join(save_path, "valid"))
-    test_dataset.save_to_disk(os.path.join(save_path, "test"))
+            # process image
+            cur_shard.set_format(type="numpy")
+            cur_shard = cur_shard.map(
+                lambda x: clip_processor.image_processor(x),
+                input_columns="bottom_image",
+                num_proc=num_proc,
+            )  # type: ignore
+            cur_shard = cur_shard.rename_column(
+                "pixel_values", "bottom_processed_image"
+            )
+            cur_shard = cur_shard.map(
+                lambda x: clip_processor.image_processor(x),
+                input_columns="top_image",
+                num_proc=num_proc,
+            )  # type: ignore
+            cur_shard = cur_shard.rename_column("pixel_values", "top_processed_image")
+            cur_shard.reset_format()
+
+            # process text
+            cur_shard = cur_shard.map(
+                clip_processor.tokenizer,
+                input_columns="bottom_text",
+                fn_kwargs={"truncation": True, "padding": True, "return_tensors": "pt"},
+                batched=True,
+                num_proc=num_proc,
+            )  # type: ignore
+            cur_shard = cur_shard.rename_column("input_ids", "bottom_input_ids")
+            cur_shard = cur_shard.rename_column(
+                "attention_mask", "bottom_attention_mask"
+            )
+            cur_shard = cur_shard.map(
+                clip_processor,
+                input_columns="top_text",
+                batched=True,
+                fn_kwargs={"truncation": True, "padding": True, "return_tensors": "pt"},
+            )
+            cur_shard = cur_shard.rename_column("input_ids", "top_input_ids")
+            cur_shard = cur_shard.rename_column("attention_mask", "top_attention_mask")
+            cur_shard.save_to_disk(os.path.join(temp_dir, f"{i}"))
+            shard_paths.append(os.path.join(temp_dir, f"{i}"))
+
+            # release memory
+            del cur_shard
+            gc.collect()
+
+        # concat shards
+        shards = [load_from_disk(cur_path) for cur_path in shard_paths]
+        dataset = concatenate_datasets(shards)
+
+        # split
+        dataset = dataset.shuffle(shuffle)
+        dataset = dataset.flatten_indices()  # type: ignore
+        dataset = dataset.train_test_split(  # type: ignore
+            train_size=split_ratios["train"], shuffle=False
+        )
+        train_dataset = dataset["train"]
+        temp_dataset = dataset["test"].train_test_split(
+            test_size=split_ratios["test"]
+            / (split_ratios["val"] + split_ratios["test"]),
+            shuffle=False,
+        )
+        valid_dataset = temp_dataset["train"]
+        test_dataset = temp_dataset["test"]
+
+        # save
+        train_dataset.save_to_disk(os.path.join(save_path, "train"))
+        valid_dataset.save_to_disk(os.path.join(save_path, "valid"))
+        test_dataset.save_to_disk(os.path.join(save_path, "test"))
