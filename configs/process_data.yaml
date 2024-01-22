@@ -3,8 +3,8 @@ defaults:
   - clip/general
 
 process_data_config:
-  num_processes: 60
-  num_shards: 30
+  num_processes: 20
+  num_shards: 120
   temp_dir_base_path: data
   shuffle_before_split: true
   split_ratios:
